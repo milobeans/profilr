@@ -1,4 +1,5 @@
 pub mod cli;
+pub mod collector;
 pub mod compare;
 pub mod config;
 pub mod languages;

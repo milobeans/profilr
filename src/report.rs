@@ -146,9 +146,13 @@ pub fn render_pretty(profile: &ProjectProfile, sort: SortKey, limit: usize) -> S
         "rank", "score", "language", "lines", "path"
     ));
     for hotspot in profile.sorted_hotspots(sort, limit) {
+        let time_str = hotspot
+            .runtime_ms
+            .map(|t| format!(" ({:.1}ms)", t))
+            .unwrap_or_default();
         lines.push(format!(
-            "{:<5} {:>8.1} {:<12} {:>7}  {}",
-            hotspot.rank, hotspot.score, hotspot.language, hotspot.lines, hotspot.path
+            "{:<5} {:>8.1} {:<12} {:>7}  {}{}",
+            hotspot.rank, hotspot.score, hotspot.language, hotspot.lines, hotspot.path, time_str
         ));
     }
     if !profile.directories.is_empty() {
@@ -214,13 +218,18 @@ fn render_markdown(profile: &ProjectProfile, sort: SortKey, limit: usize) -> Str
     out.push_str("| Rank | Score | Language | Lines | Path | Reasons |\n");
     out.push_str("| ---: | ---: | --- | ---: | --- | --- |\n");
     for hotspot in profile.sorted_hotspots(sort, limit) {
+        let path_display = if let Some(ms) = hotspot.runtime_ms {
+            format!("`{}` ({:.1}ms)", hotspot.path, ms)
+        } else {
+            format!("`{}`", hotspot.path)
+        };
         out.push_str(&format!(
-            "| {} | {:.1} | {} | {} | `{}` | {} |\n",
+            "| {} | {:.1} | {} | {} | {} | {} |\n",
             hotspot.rank,
             hotspot.score,
             hotspot.language,
             hotspot.lines,
-            hotspot.path,
+            path_display,
             hotspot.reasons.join(", ")
         ));
     }

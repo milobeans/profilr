@@ -17,6 +17,7 @@ pub struct BenchmarkOptions {
     pub iterations: usize,
     pub warmups: usize,
     pub auto_limit: usize,
+    pub profile_ecosystem: bool,
 }
 
 pub fn detect_projects(root: &Path) -> Vec<ProjectKindSummary> {
@@ -253,11 +254,26 @@ pub fn benchmark_workloads(
     root: &Path,
     workloads: &mut [WorkloadProfile],
     options: &BenchmarkOptions,
-) -> Result<()> {
+) -> Result<std::collections::HashMap<String, f64>> {
+    let mut aggregated_runtime = std::collections::HashMap::new();
     let selected_indexes = select_workloads(workloads, options.mode, options.auto_limit);
     for index in selected_indexes {
         let spec = workloads[index].spec.clone();
         workloads[index].status = "running".into();
+
+        if options.profile_ecosystem {
+            if let Ok(trace_data) = crate::collector::profile_command_ecosystem(
+                &spec.command[0],
+                &spec.command[1..],
+                Some(&spec.cwd.clone().unwrap_or_else(|| root.to_path_buf())),
+                root,
+            ) {
+                for (path, ms) in trace_data {
+                    *aggregated_runtime.entry(path).or_insert(0.0) += ms;
+                }
+            }
+        }
+
         let command = profile_command(CommandOptions {
             command: spec.command.clone(),
             iterations: options.iterations,
@@ -268,7 +284,7 @@ pub fn benchmark_workloads(
         workloads[index].status = "benchmarked".into();
         workloads[index].result = Some(command);
     }
-    Ok(())
+    Ok(aggregated_runtime)
 }
 
 pub fn benchmark_single_workload(
@@ -276,9 +292,23 @@ pub fn benchmark_single_workload(
     workload: &mut WorkloadProfile,
     iterations: usize,
     warmups: usize,
-) -> Result<()> {
+    profile_ecosystem: bool,
+) -> Result<std::collections::HashMap<String, f64>> {
     let spec = workload.spec.clone();
     workload.status = "running".into();
+
+    let mut runtime_data = std::collections::HashMap::new();
+    if profile_ecosystem {
+        if let Ok(trace_data) = crate::collector::profile_command_ecosystem(
+            &spec.command[0],
+            &spec.command[1..],
+            Some(&spec.cwd.clone().unwrap_or_else(|| root.to_path_buf())),
+            root,
+        ) {
+            runtime_data = trace_data;
+        }
+    }
+
     let command = profile_command(CommandOptions {
         command: spec.command.clone(),
         iterations,
@@ -288,7 +318,7 @@ pub fn benchmark_single_workload(
     .with_context(|| format!("benchmark workload {}", spec.name))?;
     workload.status = "benchmarked".into();
     workload.result = Some(command);
-    Ok(())
+    Ok(runtime_data)
 }
 
 fn push_workload<const N: usize>(

@@ -23,19 +23,30 @@ pub fn compare_reports(base: &Path, head: &Path) -> Result<CompareReport> {
 }
 
 fn compare_hotspots(base: &ProjectProfile, head: &ProjectProfile) -> Vec<HotspotDelta> {
-    let base_map: BTreeMap<&str, f64> = base
+    let base_map: BTreeMap<&str, &crate::model::Hotspot> = base
         .hotspots
         .iter()
-        .map(|hotspot| (hotspot.path.as_str(), hotspot.score))
+        .map(|hotspot| (hotspot.path.as_str(), hotspot))
         .collect();
     let mut deltas = Vec::new();
     for hotspot in &head.hotspots {
-        let base_score = base_map.get(hotspot.path.as_str()).copied().unwrap_or(0.0);
+        let (base_score, base_runtime) = base_map
+            .get(hotspot.path.as_str())
+            .map(|h| (h.score, h.runtime_ms))
+            .unwrap_or((0.0, None));
+        let delta_runtime = match (base_runtime, hotspot.runtime_ms) {
+            (Some(b), Some(h)) => Some(h - b),
+            (None, Some(h)) => Some(h),
+            _ => None,
+        };
         deltas.push(HotspotDelta {
             path: hotspot.path.clone(),
             base_score,
             head_score: hotspot.score,
             delta_score: hotspot.score - base_score,
+            base_runtime_ms: base_runtime,
+            head_runtime_ms: hotspot.runtime_ms,
+            delta_runtime_ms: delta_runtime,
         });
     }
     deltas.sort_by(|left, right| {
@@ -168,6 +179,8 @@ mod tests {
                 test_markers: 0,
                 max_line_chars: 20,
                 reasons: vec!["baseline complexity".into()],
+                runtime_ms: None,
+                runtime_samples: None,
             }],
             workloads: vec![WorkloadProfile {
                 spec: WorkloadSpec {

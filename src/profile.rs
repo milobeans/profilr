@@ -234,6 +234,8 @@ fn analyze_file(root: &Path, path: &Path, language: &str, text: &str, bytes: u64
             async_markers,
             max_line_chars,
         ),
+        runtime_ms: None,
+        runtime_samples: None,
     }
 }
 
@@ -463,11 +465,25 @@ fn top_level_path(path: &str) -> String {
 
 fn rank_hotspots(hotspots: &mut [Hotspot], sort: SortKey) {
     hotspots.sort_by(|left, right| match sort {
-        SortKey::Score | SortKey::Time => right
+        SortKey::Score => right
             .score
             .partial_cmp(&left.score)
             .unwrap_or(std::cmp::Ordering::Equal)
             .then_with(|| left.path.cmp(&right.path)),
+        SortKey::Time => {
+            let left_time = left.runtime_ms.unwrap_or(0.0);
+            let right_time = right.runtime_ms.unwrap_or(0.0);
+            right_time
+                .partial_cmp(&left_time)
+                .unwrap_or(std::cmp::Ordering::Equal)
+                .then_with(|| {
+                    right
+                        .score
+                        .partial_cmp(&left.score)
+                        .unwrap_or(std::cmp::Ordering::Equal)
+                })
+                .then_with(|| left.path.cmp(&right.path))
+        }
         SortKey::Complexity => right
             .complexity_markers()
             .cmp(&left.complexity_markers())
@@ -506,6 +522,78 @@ fn now_unix_ms() -> u128 {
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
         .as_millis()
+}
+
+pub fn merge_runtime_attribution(
+    profile: &mut ProjectProfile,
+    runtime_data: &std::collections::HashMap<String, f64>,
+    sort: SortKey,
+) {
+    if runtime_data.is_empty() {
+        return;
+    }
+
+    for (path, &ms) in runtime_data {
+        let mut found = false;
+        for hotspot in &mut profile.hotspots {
+            if &hotspot.path == path {
+                hotspot.runtime_ms = Some(ms);
+                let reason_msg = format!("runtime hotspot ({:.1}ms)", ms);
+                if !hotspot.reasons.contains(&reason_msg) {
+                    hotspot.reasons.push(reason_msg);
+                }
+                found = true;
+                break;
+            }
+        }
+
+        if !found {
+            let full_path = profile.root.join(path);
+            if full_path.is_file() {
+                if let Some(language) = crate::languages::language_for_path(&full_path) {
+                    if let Ok(metadata) = fs::metadata(&full_path) {
+                        let bytes = metadata.len();
+                        let text = fs::read_to_string(&full_path).unwrap_or_default();
+                        let mut hotspot =
+                            analyze_file(&profile.root, &full_path, language.name, &text, bytes);
+                        hotspot.runtime_ms = Some(ms);
+                        hotspot
+                            .reasons
+                            .push(format!("runtime hotspot ({:.1}ms)", ms));
+                        profile.hotspots.push(hotspot);
+                    }
+                }
+            } else {
+                profile.hotspots.push(Hotspot {
+                    rank: 0,
+                    path: path.clone(),
+                    language: "Unknown".to_string(),
+                    score: 0.0,
+                    lines: 0,
+                    bytes: 0,
+                    functions: 0,
+                    branches: 0,
+                    loops: 0,
+                    allocations: 0,
+                    blocking_io: 0,
+                    async_markers: 0,
+                    test_markers: 0,
+                    max_line_chars: 0,
+                    reasons: vec![format!("runtime hotspot ({:.1}ms)", ms)],
+                    runtime_ms: Some(ms),
+                    runtime_samples: None,
+                });
+            }
+        }
+    }
+
+    profile.total_profiled_files = profile.hotspots.len();
+    profile.total_lines = profile.hotspots.iter().map(|h| h.lines).sum();
+    profile.total_bytes = profile.hotspots.iter().map(|h| h.bytes).sum();
+
+    rank_hotspots(&mut profile.hotspots, sort);
+    profile.languages = summarize_languages(&profile.hotspots);
+    profile.directories = summarize_directories(&profile.hotspots);
 }
 
 #[cfg(test)]
@@ -566,5 +654,67 @@ mod tests {
             .workloads
             .iter()
             .any(|workload| workload.spec.name == "cargo-check"));
+    }
+
+    #[test]
+    fn test_merge_runtime_attribution() {
+        let mut profile = ProjectProfile {
+            schema_version: "2".into(),
+            root: std::path::PathBuf::from("/tmp/demo"),
+            generated_unix_ms: 0,
+            scan_duration_ms: 0,
+            total_files: 1,
+            total_profiled_files: 1,
+            total_lines: 10,
+            total_bytes: 100,
+            skipped_files: 0,
+            warnings: Vec::new(),
+            detected_projects: Vec::new(),
+            languages: Vec::new(),
+            directories: Vec::new(),
+            hotspots: vec![Hotspot {
+                rank: 1,
+                path: "src/main.rs".into(),
+                language: "Rust".into(),
+                score: 10.0,
+                lines: 10,
+                bytes: 100,
+                functions: 1,
+                branches: 0,
+                loops: 0,
+                allocations: 0,
+                blocking_io: 0,
+                async_markers: 0,
+                test_markers: 0,
+                max_line_chars: 20,
+                reasons: vec!["baseline complexity".into()],
+                runtime_ms: None,
+                runtime_samples: None,
+            }],
+            workloads: Vec::new(),
+        };
+
+        let mut runtime_data = std::collections::HashMap::new();
+        runtime_data.insert("src/main.rs".to_string(), 150.0);
+        runtime_data.insert("src/other.rs".to_string(), 50.0);
+
+        merge_runtime_attribution(&mut profile, &runtime_data, SortKey::Time);
+
+        let main_hotspot = profile
+            .hotspots
+            .iter()
+            .find(|h| h.path == "src/main.rs")
+            .unwrap();
+        assert_eq!(main_hotspot.runtime_ms, Some(150.0));
+        assert!(main_hotspot
+            .reasons
+            .contains(&"runtime hotspot (150.0ms)".to_string()));
+
+        let other_hotspot = profile
+            .hotspots
+            .iter()
+            .find(|h| h.path == "src/other.rs")
+            .unwrap();
+        assert_eq!(other_hotspot.runtime_ms, Some(50.0));
     }
 }

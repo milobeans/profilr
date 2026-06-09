@@ -113,6 +113,14 @@ struct ProjectArgs {
     warmups: Option<usize>,
     #[arg(long, value_name = "PATH")]
     save: Option<PathBuf>,
+    #[arg(
+        long,
+        value_name = "PATH",
+        help = "Ingest a CPU profile / trace file (V8 .cpuprofile or cProfile JSON/stats)"
+    )]
+    ingest_trace: Option<PathBuf>,
+    #[arg(long, help = "Enable per-ecosystem profiling for benchmark workloads")]
+    profile: bool,
 }
 
 #[derive(Args, Debug)]
@@ -181,6 +189,8 @@ struct WorkloadsRunArgs {
     iterations: Option<usize>,
     #[arg(long)]
     warmups: Option<usize>,
+    #[arg(long, help = "Enable per-ecosystem profiling for the workload(s)")]
+    profile: bool,
 }
 
 #[derive(Args, Debug)]
@@ -347,6 +357,8 @@ fn run_default(cli: &Cli) -> Result<()> {
         iterations: None,
         warmups: None,
         save: None,
+        ingest_trace: None,
+        profile: false,
     };
     let loaded = load_config(cli.config.as_deref(), &args.path)?;
     let sort = args.sort.unwrap_or(loaded.config.output.sort);
@@ -458,7 +470,7 @@ fn run_workloads(cli: &Cli, args: &WorkloadsArgs) -> Result<()> {
                 .unwrap_or(loaded.config.workloads.iterations);
             let warmups = run_args.warmups.unwrap_or(loaded.config.workloads.warmups);
 
-            if run_args.all {
+            let runtime_data = if run_args.all {
                 benchmark_workloads(
                     &run_args.path,
                     &mut workloads,
@@ -467,14 +479,21 @@ fn run_workloads(cli: &Cli, args: &WorkloadsArgs) -> Result<()> {
                         iterations,
                         warmups,
                         auto_limit: loaded.config.workloads.auto_limit,
+                        profile_ecosystem: run_args.profile,
                     },
-                )?;
+                )?
             } else if let Some(name) = &run_args.name {
                 let workload = workloads
                     .iter_mut()
                     .find(|workload| workload.spec.name == *name)
                     .with_context(|| format!("unknown workload `{name}`"))?;
-                benchmark_single_workload(&run_args.path, workload, iterations, warmups)?;
+                benchmark_single_workload(
+                    &run_args.path,
+                    workload,
+                    iterations,
+                    warmups,
+                    run_args.profile,
+                )?
             } else {
                 benchmark_workloads(
                     &run_args.path,
@@ -484,9 +503,10 @@ fn run_workloads(cli: &Cli, args: &WorkloadsArgs) -> Result<()> {
                         iterations,
                         warmups,
                         auto_limit: loaded.config.workloads.auto_limit,
+                        profile_ecosystem: run_args.profile,
                     },
-                )?;
-            }
+                )?
+            };
 
             if cli.json {
                 emit_json(&workloads)
@@ -501,6 +521,16 @@ fn run_workloads(cli: &Cli, args: &WorkloadsArgs) -> Result<()> {
                         "{:<18} {:<8} {}",
                         workload.spec.name, workload.spec.kind, summary
                     );
+                }
+                if run_args.profile && !runtime_data.is_empty() {
+                    println!();
+                    println!("runtime attribution:");
+                    let mut sorted: Vec<_> = runtime_data.iter().collect();
+                    sorted
+                        .sort_by(|a, b| b.1.partial_cmp(a.1).unwrap_or(std::cmp::Ordering::Equal));
+                    for (file, ms) in sorted.iter().take(5) {
+                        println!("  {:<40} {:.2} ms", file, ms);
+                    }
                 }
                 Ok(())
             }
@@ -567,7 +597,7 @@ fn build_project_profile(
     let mut profile = profile_project(&args.path, config, sort, &args.languages)?;
     let bench_mode = args.bench.unwrap_or(config.workloads.benchmark_mode);
     if bench_mode != BenchmarkMode::Off {
-        benchmark_workloads(
+        let runtime_data = benchmark_workloads(
             &args.path,
             &mut profile.workloads,
             &BenchmarkOptions {
@@ -575,8 +605,16 @@ fn build_project_profile(
                 iterations: resolved_iterations(args, config),
                 warmups: resolved_warmups(args, config),
                 auto_limit: config.workloads.auto_limit,
+                profile_ecosystem: args.profile,
             },
         )?;
+        if args.profile {
+            crate::profile::merge_runtime_attribution(&mut profile, &runtime_data, sort);
+        }
+    }
+    if let Some(ref trace_path) = args.ingest_trace {
+        let trace_data = crate::collector::ingest_trace_file(trace_path, &profile.root)?;
+        crate::profile::merge_runtime_attribution(&mut profile, &trace_data, sort);
     }
     Ok(profile)
 }

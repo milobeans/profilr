@@ -152,6 +152,10 @@ pub struct Hotspot {
     pub test_markers: usize,
     pub max_line_chars: usize,
     pub reasons: Vec<String>,
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub runtime_ms: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub runtime_samples: Option<usize>,
 }
 
 impl Hotspot {
@@ -252,6 +256,12 @@ pub struct HotspotDelta {
     pub base_score: f64,
     pub head_score: f64,
     pub delta_score: f64,
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub base_runtime_ms: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub head_runtime_ms: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub delta_runtime_ms: Option<f64>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -281,11 +291,20 @@ fn compare_hotspots(left: &Hotspot, right: &Hotspot, sort: SortKey) -> std::cmp:
             .partial_cmp(&left.score)
             .unwrap_or(std::cmp::Ordering::Equal)
             .then_with(|| left.path.cmp(&right.path)),
-        SortKey::Time => right
-            .score
-            .partial_cmp(&left.score)
-            .unwrap_or(std::cmp::Ordering::Equal)
-            .then_with(|| left.path.cmp(&right.path)),
+        SortKey::Time => {
+            let left_time = left.runtime_ms.unwrap_or(0.0);
+            let right_time = right.runtime_ms.unwrap_or(0.0);
+            right_time
+                .partial_cmp(&left_time)
+                .unwrap_or(std::cmp::Ordering::Equal)
+                .then_with(|| {
+                    right
+                        .score
+                        .partial_cmp(&left.score)
+                        .unwrap_or(std::cmp::Ordering::Equal)
+                })
+                .then_with(|| left.path.cmp(&right.path))
+        }
         SortKey::Complexity => right
             .complexity_markers()
             .cmp(&left.complexity_markers())

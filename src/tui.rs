@@ -599,9 +599,14 @@ fn draw_hotspots(frame: &mut Frame<'_>, app: &TuiApp, area: Rect) {
         } else {
             Style::default()
         };
+        let time_str = hotspot
+            .runtime_ms
+            .map(|t| format!("{:.1}ms", t))
+            .unwrap_or_else(|| "-".to_string());
         Row::new(vec![
             Cell::from(hotspot.rank.to_string()),
             Cell::from(format!("{:.0}", hotspot.score)),
+            Cell::from(time_str),
             Cell::from(hotspot.language.clone()),
             Cell::from(hotspot.lines.to_string()),
             Cell::from(hotspot.path.clone()),
@@ -613,13 +618,14 @@ fn draw_hotspots(frame: &mut Frame<'_>, app: &TuiApp, area: Rect) {
         [
             Constraint::Length(5),
             Constraint::Length(7),
+            Constraint::Length(10),
             Constraint::Length(12),
             Constraint::Length(7),
             Constraint::Min(20),
         ],
     )
     .header(
-        Row::new(vec!["rank", "score", "language", "lines", "path"]).style(
+        Row::new(vec!["rank", "score", "time", "language", "lines", "path"]).style(
             Style::default()
                 .fg(Color::Yellow)
                 .add_modifier(Modifier::BOLD),
@@ -639,6 +645,10 @@ fn draw_hotspot_details(frame: &mut Frame<'_>, app: &TuiApp, area: Rect) {
         return;
     };
 
+    let runtime_str = hotspot
+        .runtime_ms
+        .map(|t| format!("{:.1} ms", t))
+        .unwrap_or_else(|| "N/A".to_string());
     let lines = vec![
         Line::from(Span::styled(
             hotspot.path.clone(),
@@ -647,8 +657,8 @@ fn draw_hotspot_details(frame: &mut Frame<'_>, app: &TuiApp, area: Rect) {
                 .add_modifier(Modifier::BOLD),
         )),
         Line::from(format!(
-            "{} score {:.1}, {} lines, {} bytes",
-            hotspot.language, hotspot.score, hotspot.lines, hotspot.bytes
+            "{} score {:.1}, runtime {}, {} lines, {} bytes",
+            hotspot.language, hotspot.score, runtime_str, hotspot.lines, hotspot.bytes
         )),
         Line::from(""),
         Line::from(metric_bar("branches", hotspot.branches, 40)),
@@ -948,16 +958,23 @@ fn run_selected_workload(
     let iterations = app.iterations;
     let warmups = app.warmups;
     let result = if let Some(workload) = app.selected_workload_mut() {
-        benchmark_single_workload(&root, workload, iterations, warmups)
+        benchmark_single_workload(&root, workload, iterations, warmups, true)
     } else {
-        Ok(())
+        Ok(std::collections::HashMap::new())
     };
     execute!(terminal.backend_mut(), EnterAlternateScreen)?;
     enable_raw_mode()?;
     terminal.clear()?;
 
     let message = match result {
-        Ok(()) => {
+        Ok(runtime_data) => {
+            if !runtime_data.is_empty() {
+                crate::profile::merge_runtime_attribution(
+                    &mut app.profile,
+                    &runtime_data,
+                    app.sort,
+                );
+            }
             let mean = app
                 .profile
                 .workloads
@@ -995,12 +1012,13 @@ fn metric_bar(label: &str, value: usize, cap: usize) -> String {
 
 fn next_sort(sort: SortKey) -> SortKey {
     match sort {
-        SortKey::Score => SortKey::Complexity,
+        SortKey::Score => SortKey::Time,
+        SortKey::Time => SortKey::Complexity,
         SortKey::Complexity => SortKey::Lines,
         SortKey::Lines => SortKey::Size,
         SortKey::Size => SortKey::Language,
         SortKey::Language => SortKey::Path,
-        SortKey::Path | SortKey::Time => SortKey::Score,
+        SortKey::Path => SortKey::Score,
     }
 }
 
