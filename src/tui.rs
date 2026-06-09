@@ -966,9 +966,9 @@ fn run_selected_workload(
                 .and_then(|workload| workload.result.as_ref())
                 .map(|result| result.stats.mean_ms)
                 .unwrap_or(0.0);
-            format!("benchmarked {} at {:.2} ms mean", workload_name, mean)
+            format!("benchmarked {workload_name} at {mean:.2} ms mean")
         }
-        Err(err) => format!("workload {} failed: {err}", workload_name),
+        Err(err) => format!("workload {workload_name} failed: {err}"),
     };
     Ok(Some(message))
 }
