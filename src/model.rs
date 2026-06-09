@@ -32,8 +32,28 @@ impl SortKey {
     }
 }
 
+#[derive(Copy, Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize, ValueEnum)]
+#[serde(rename_all = "kebab-case")]
+pub enum BenchmarkMode {
+    #[default]
+    Off,
+    Auto,
+    All,
+}
+
+impl BenchmarkMode {
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Off => "off",
+            Self::Auto => "auto",
+            Self::All => "all",
+        }
+    }
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct ProjectProfile {
+    pub schema_version: String,
     pub root: PathBuf,
     pub generated_unix_ms: u128,
     pub scan_duration_ms: u128,
@@ -43,8 +63,11 @@ pub struct ProjectProfile {
     pub total_bytes: u64,
     pub skipped_files: usize,
     pub warnings: Vec<String>,
+    pub detected_projects: Vec<ProjectKindSummary>,
     pub languages: Vec<LanguageSummary>,
+    pub directories: Vec<DirectorySummary>,
     pub hotspots: Vec<Hotspot>,
+    pub workloads: Vec<WorkloadProfile>,
 }
 
 impl ProjectProfile {
@@ -54,6 +77,41 @@ impl ProjectProfile {
         hotspots.truncate(limit.min(hotspots.len()));
         hotspots
     }
+
+    pub fn sorted_directories(&self, limit: usize) -> Vec<&DirectorySummary> {
+        let mut directories: Vec<&DirectorySummary> = self.directories.iter().collect();
+        directories.sort_by(|left, right| {
+            right
+                .score
+                .partial_cmp(&left.score)
+                .unwrap_or(std::cmp::Ordering::Equal)
+                .then_with(|| left.path.cmp(&right.path))
+        });
+        directories.truncate(limit.min(directories.len()));
+        directories
+    }
+
+    pub fn benchmarked_workloads(&self) -> usize {
+        self.workloads
+            .iter()
+            .filter(|workload| workload.result.is_some())
+            .count()
+    }
+
+    pub fn total_workload_time_ms(&self) -> f64 {
+        self.workloads
+            .iter()
+            .filter_map(|workload| workload.result.as_ref())
+            .map(|result| result.stats.mean_ms)
+            .sum()
+    }
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct ProjectKindSummary {
+    pub kind: String,
+    pub evidence: String,
+    pub default_runner: Option<String>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -63,6 +121,17 @@ pub struct LanguageSummary {
     pub lines: usize,
     pub bytes: u64,
     pub score: f64,
+    pub top_path: Option<String>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct DirectorySummary {
+    pub path: String,
+    pub files: usize,
+    pub lines: usize,
+    pub bytes: u64,
+    pub score: f64,
+    pub dominant_language: Option<String>,
     pub top_path: Option<String>,
 }
 
@@ -123,10 +192,29 @@ pub struct SnippetProfile {
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct CommandProfile {
     pub command: Vec<String>,
+    pub cwd: Option<PathBuf>,
     pub stats: TimingStats,
     pub exit_code: Option<i32>,
     pub stdout_preview: String,
     pub stderr_preview: String,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct WorkloadSpec {
+    pub name: String,
+    pub kind: String,
+    pub command: Vec<String>,
+    pub cwd: Option<PathBuf>,
+    pub description: String,
+    pub detected_from: String,
+    pub priority: usize,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct WorkloadProfile {
+    pub spec: WorkloadSpec,
+    pub result: Option<CommandProfile>,
+    pub status: String,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -138,6 +226,7 @@ pub struct DoctorReport {
     pub auth_required: bool,
     pub default_mode: String,
     pub runners: Vec<AdapterStatus>,
+    pub detected_projects: Vec<ProjectKindSummary>,
     pub checks: Vec<DoctorCheck>,
 }
 
@@ -146,6 +235,39 @@ pub struct DoctorCheck {
     pub name: String,
     pub ok: bool,
     pub details: String,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct CompareReport {
+    pub base: PathBuf,
+    pub head: PathBuf,
+    pub hotspot_deltas: Vec<HotspotDelta>,
+    pub directory_deltas: Vec<DirectoryDelta>,
+    pub workload_deltas: Vec<WorkloadDelta>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct HotspotDelta {
+    pub path: String,
+    pub base_score: f64,
+    pub head_score: f64,
+    pub delta_score: f64,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct DirectoryDelta {
+    pub path: String,
+    pub base_score: f64,
+    pub head_score: f64,
+    pub delta_score: f64,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct WorkloadDelta {
+    pub name: String,
+    pub base_mean_ms: Option<f64>,
+    pub head_mean_ms: Option<f64>,
+    pub delta_mean_ms: Option<f64>,
 }
 
 pub fn sort_hotspots(hotspots: &mut [&Hotspot], sort: SortKey) {

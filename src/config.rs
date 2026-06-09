@@ -3,12 +3,13 @@ use std::path::{Path, PathBuf};
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 
-use crate::model::SortKey;
+use crate::model::{BenchmarkMode, SortKey};
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Config {
     pub scan: ScanConfig,
     pub output: OutputConfig,
+    pub workloads: WorkloadConfig,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -27,6 +28,15 @@ pub struct OutputConfig {
     pub sort: SortKey,
 }
 
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct WorkloadConfig {
+    pub benchmark_mode: BenchmarkMode,
+    pub max_detected: usize,
+    pub auto_limit: usize,
+    pub iterations: usize,
+    pub warmups: usize,
+}
+
 #[derive(Clone, Debug)]
 pub struct LoadedConfig {
     pub config: Config,
@@ -37,6 +47,7 @@ pub struct LoadedConfig {
 struct PartialConfig {
     scan: Option<PartialScanConfig>,
     output: Option<PartialOutputConfig>,
+    workloads: Option<PartialWorkloadConfig>,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -53,6 +64,15 @@ struct PartialScanConfig {
 struct PartialOutputConfig {
     limit: Option<usize>,
     sort: Option<SortKey>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+struct PartialWorkloadConfig {
+    benchmark_mode: Option<BenchmarkMode>,
+    max_detected: Option<usize>,
+    auto_limit: Option<usize>,
+    iterations: Option<usize>,
+    warmups: Option<usize>,
 }
 
 impl Default for Config {
@@ -92,6 +112,13 @@ impl Default for Config {
                 limit: 30,
                 sort: SortKey::Score,
             },
+            workloads: WorkloadConfig {
+                benchmark_mode: BenchmarkMode::Off,
+                max_detected: 8,
+                auto_limit: 2,
+                iterations: 3,
+                warmups: 0,
+            },
         }
     }
 }
@@ -129,6 +156,24 @@ impl Config {
             }
             if let Some(value) = output.sort {
                 self.output.sort = value;
+            }
+        }
+
+        if let Some(workloads) = partial.workloads {
+            if let Some(value) = workloads.benchmark_mode {
+                self.workloads.benchmark_mode = value;
+            }
+            if let Some(value) = workloads.max_detected {
+                self.workloads.max_detected = value;
+            }
+            if let Some(value) = workloads.auto_limit {
+                self.workloads.auto_limit = value;
+            }
+            if let Some(value) = workloads.iterations {
+                self.workloads.iterations = value.max(1);
+            }
+            if let Some(value) = workloads.warmups {
+                self.workloads.warmups = value;
             }
         }
     }
@@ -189,5 +234,6 @@ mod tests {
         let parsed: PartialConfig = toml::from_str(&rendered).expect("rendered config parses");
         assert!(parsed.scan.is_some());
         assert!(parsed.output.is_some());
+        assert!(parsed.workloads.is_some());
     }
 }

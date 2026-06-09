@@ -5,17 +5,25 @@ use std::{
     process::ExitCode,
 };
 
-use anyhow::{Context, Result};
+use anyhow::{bail, Context, Result};
 use clap::{Args, Parser, Subcommand, ValueEnum};
 
 use crate::{
+    compare::compare_reports,
     config::{load_config, Config},
     languages::{language_names, LANGUAGES},
-    model::{DoctorCheck, DoctorReport, SortKey},
+    model::{BenchmarkMode, DoctorCheck, DoctorReport, SortKey},
     profile::profile_project,
-    report::{emit_command, emit_json, emit_project_profile, emit_snippet, ReportFormat},
+    report::{
+        emit_command, emit_compare, emit_json, emit_project_profile, emit_snippet,
+        save_profile_json, ReportFormat,
+    },
     snippet::{profile_command, profile_snippet, runner_statuses, CommandOptions, SnippetOptions},
     tui::run_tui,
+    workload::{
+        benchmark_single_workload, benchmark_workloads, detect_projects, detect_workloads,
+        BenchmarkOptions,
+    },
 };
 
 #[derive(Parser, Debug)]
@@ -23,7 +31,7 @@ use crate::{
     name = "profilr",
     version,
     about = "Fast project, command, and snippet profiler",
-    long_about = "profilr profiles a codebase by default with a responsive TUI, and exposes JSON-first CLI modes for agents and automation."
+    long_about = "profilr profiles whole projects by default with an interactive TUI, inferred workloads, saved JSON reports, and agent-friendly CLI modes."
 )]
 pub struct Cli {
     #[arg(value_name = "PATH", default_value = ".")]
@@ -62,17 +70,21 @@ pub struct Cli {
 #[derive(Subcommand, Debug)]
 enum Commands {
     /// Profile a project and write a deterministic report.
-    Run(RunArgs),
+    Run(ProjectArgs),
     /// Open the interactive terminal UI for a project profile.
-    Tui(RunArgs),
+    Tui(ProjectArgs),
     /// Profile a project and write pretty, JSON, Markdown, or CSV output.
-    Report(ReportArgs),
+    Report(ProjectArgs),
     /// Time a small code snippet with a language runner.
     Snippet(SnippetArgs),
     /// Time an arbitrary command.
     Command(CommandArgs),
-    /// Check local setup, config, and snippet runners.
-    Doctor,
+    /// Compare two saved JSON project reports.
+    Compare(CompareArgs),
+    /// Detect or run inferred project workloads.
+    Workloads(WorkloadsArgs),
+    /// Check local setup, config, project detection, and snippet runners.
+    Doctor(DoctorArgs),
     /// Print default configuration.
     Config(ConfigArgs),
     /// Inspect profilr language adapters and runner support.
@@ -80,7 +92,7 @@ enum Commands {
 }
 
 #[derive(Args, Debug, Clone)]
-struct RunArgs {
+struct ProjectArgs {
     #[arg(value_name = "PATH", default_value = ".")]
     path: PathBuf,
     #[arg(long, value_enum)]
@@ -93,22 +105,14 @@ struct RunArgs {
     format: ReportFormat,
     #[arg(long, value_name = "PATH")]
     output: Option<PathBuf>,
-}
-
-#[derive(Args, Debug, Clone)]
-struct ReportArgs {
-    #[arg(value_name = "PATH", default_value = ".")]
-    path: PathBuf,
     #[arg(long, value_enum)]
-    sort: Option<SortKey>,
+    bench: Option<BenchmarkMode>,
     #[arg(long)]
-    limit: Option<usize>,
-    #[arg(long = "language", value_name = "NAME")]
-    languages: Vec<String>,
-    #[arg(long, value_enum, default_value_t = ReportFormat::Markdown)]
-    format: ReportFormat,
+    iterations: Option<usize>,
+    #[arg(long)]
+    warmups: Option<usize>,
     #[arg(long, value_name = "PATH")]
-    output: Option<PathBuf>,
+    save: Option<PathBuf>,
 }
 
 #[derive(Args, Debug)]
@@ -131,8 +135,58 @@ struct CommandArgs {
     iterations: usize,
     #[arg(long, default_value_t = 0)]
     warmups: usize,
+    #[arg(long, value_name = "PATH")]
+    cwd: Option<PathBuf>,
     #[arg(required = true, last = true)]
     command: Vec<String>,
+}
+
+#[derive(Args, Debug)]
+struct CompareArgs {
+    #[arg(value_name = "BASE")]
+    base: PathBuf,
+    #[arg(value_name = "HEAD")]
+    head: PathBuf,
+}
+
+#[derive(Args, Debug)]
+struct WorkloadsArgs {
+    #[command(subcommand)]
+    command: WorkloadsCommand,
+}
+
+#[derive(Subcommand, Debug)]
+enum WorkloadsCommand {
+    /// List inferred workloads for a project.
+    List(WorkloadsListArgs),
+    /// Run one or more inferred workloads for a project.
+    Run(WorkloadsRunArgs),
+}
+
+#[derive(Args, Debug)]
+struct WorkloadsListArgs {
+    #[arg(value_name = "PATH", default_value = ".")]
+    path: PathBuf,
+}
+
+#[derive(Args, Debug)]
+struct WorkloadsRunArgs {
+    #[arg(value_name = "PATH", default_value = ".")]
+    path: PathBuf,
+    #[arg(long)]
+    name: Option<String>,
+    #[arg(long)]
+    all: bool,
+    #[arg(long)]
+    iterations: Option<usize>,
+    #[arg(long)]
+    warmups: Option<usize>,
+}
+
+#[derive(Args, Debug)]
+struct DoctorArgs {
+    #[arg(value_name = "PATH", default_value = ".")]
+    path: PathBuf,
 }
 
 #[derive(Args, Debug)]
@@ -200,7 +254,7 @@ fn dispatch(cli: &Cli) -> Result<()> {
     log_event(cli, "start")?;
     match &cli.command {
         None => run_default(cli),
-        Some(Commands::Run(args)) => run_profile(cli, args.clone(), cli.json),
+        Some(Commands::Run(args)) => run_profile(cli, args, cli.json),
         Some(Commands::Tui(args)) => open_tui(cli, args),
         Some(Commands::Report(args)) => run_report(cli, args),
         Some(Commands::Snippet(args)) => {
@@ -218,11 +272,17 @@ fn dispatch(cli: &Cli) -> Result<()> {
                 command: args.command.clone(),
                 iterations: args.iterations,
                 warmups: args.warmups,
+                cwd: args.cwd.clone(),
             })?;
             emit_command(&profile, cli.json)
         }
-        Some(Commands::Doctor) => {
-            let report = doctor_report(cli)?;
+        Some(Commands::Compare(args)) => {
+            let report = compare_reports(&args.base, &args.head)?;
+            emit_compare(&report, cli.json)
+        }
+        Some(Commands::Workloads(args)) => run_workloads(cli, args),
+        Some(Commands::Doctor(args)) => {
+            let report = doctor_report(cli, &args.path)?;
             if cli.json {
                 emit_json(&report)
             } else {
@@ -233,11 +293,10 @@ fn dispatch(cli: &Cli) -> Result<()> {
         Some(Commands::Config(args)) => {
             if args.print_default {
                 println!("{}", Config::default_toml()?);
-                Ok(())
             } else {
                 println!("Use `profilr config --print-default` to print a starter .profilr.toml");
-                Ok(())
             }
+            Ok(())
         }
         Some(Commands::Tools(args)) => match args.command {
             ToolsCommand::Languages => {
@@ -277,21 +336,39 @@ fn dispatch(cli: &Cli) -> Result<()> {
 }
 
 fn run_default(cli: &Cli) -> Result<()> {
-    let loaded = load_config(cli.config.as_deref(), &cli.path)?;
-    let sort = loaded.config.output.sort;
-    let limit = loaded.config.output.limit;
-    let profile = profile_project(&cli.path, &loaded.config, sort, &[])?;
+    let args = ProjectArgs {
+        path: cli.path.clone(),
+        sort: None,
+        limit: None,
+        languages: Vec::new(),
+        format: ReportFormat::Pretty,
+        output: None,
+        bench: None,
+        iterations: None,
+        warmups: None,
+        save: None,
+    };
+    let loaded = load_config(cli.config.as_deref(), &args.path)?;
+    let sort = args.sort.unwrap_or(loaded.config.output.sort);
+    let limit = args.limit.unwrap_or(loaded.config.output.limit);
+    let profile = build_project_profile(&args, &loaded.config, sort)?;
 
     if cli.json {
         emit_project_profile(&profile, ReportFormat::Json, sort, limit, None)
     } else if std::io::stdout().is_terminal() {
-        run_tui(profile, sort, limit)
+        run_tui(
+            profile,
+            sort,
+            limit,
+            loaded.config.workloads.iterations,
+            loaded.config.workloads.warmups,
+        )
     } else {
         emit_project_profile(&profile, ReportFormat::Pretty, sort, limit, None)
     }
 }
 
-fn run_profile(cli: &Cli, args: RunArgs, force_json: bool) -> Result<()> {
+fn run_profile(cli: &Cli, args: &ProjectArgs, force_json: bool) -> Result<()> {
     let loaded = load_config(cli.config.as_deref(), &args.path)?;
     let sort = args.sort.unwrap_or(loaded.config.output.sort);
     let limit = args.limit.unwrap_or(loaded.config.output.limit);
@@ -300,15 +377,21 @@ fn run_profile(cli: &Cli, args: RunArgs, force_json: bool) -> Result<()> {
     } else {
         args.format
     };
-    let profile = profile_project(&args.path, &loaded.config, sort, &args.languages)?;
-    emit_project_profile(&profile, format, sort, limit, args.output)
+    let profile = build_project_profile(args, &loaded.config, sort)?;
+    if let Some(path) = &args.save {
+        save_profile_json(&profile, path.clone())?;
+    }
+    emit_project_profile(&profile, format, sort, limit, args.output.clone())
 }
 
-fn open_tui(cli: &Cli, args: &RunArgs) -> Result<()> {
+fn open_tui(cli: &Cli, args: &ProjectArgs) -> Result<()> {
     let loaded = load_config(cli.config.as_deref(), &args.path)?;
     let sort = args.sort.unwrap_or(loaded.config.output.sort);
     let limit = args.limit.unwrap_or(loaded.config.output.limit);
-    let profile = profile_project(&args.path, &loaded.config, sort, &args.languages)?;
+    let profile = build_project_profile(args, &loaded.config, sort)?;
+    if let Some(path) = &args.save {
+        save_profile_json(&profile, path.clone())?;
+    }
     if cli.json {
         emit_project_profile(
             &profile,
@@ -318,11 +401,17 @@ fn open_tui(cli: &Cli, args: &RunArgs) -> Result<()> {
             args.output.clone(),
         )
     } else {
-        run_tui(profile, sort, limit)
+        run_tui(
+            profile,
+            sort,
+            limit,
+            resolved_iterations(args, &loaded.config),
+            resolved_warmups(args, &loaded.config),
+        )
     }
 }
 
-fn run_report(cli: &Cli, args: &ReportArgs) -> Result<()> {
+fn run_report(cli: &Cli, args: &ProjectArgs) -> Result<()> {
     let loaded = load_config(cli.config.as_deref(), &args.path)?;
     let sort = args.sort.unwrap_or(loaded.config.output.sort);
     let limit = args.limit.unwrap_or(loaded.config.output.limit);
@@ -331,18 +420,103 @@ fn run_report(cli: &Cli, args: &ReportArgs) -> Result<()> {
     } else {
         args.format
     };
-    let profile = profile_project(&args.path, &loaded.config, sort, &args.languages)?;
+    let profile = build_project_profile(args, &loaded.config, sort)?;
+    if let Some(path) = &args.save {
+        save_profile_json(&profile, path.clone())?;
+    }
     emit_project_profile(&profile, format, sort, limit, args.output.clone())
 }
 
-fn doctor_report(cli: &Cli) -> Result<DoctorReport> {
+fn run_workloads(cli: &Cli, args: &WorkloadsArgs) -> Result<()> {
+    match &args.command {
+        WorkloadsCommand::List(list_args) => {
+            let loaded = load_config(cli.config.as_deref(), &list_args.path)?;
+            let workloads = detect_workloads(&list_args.path, loaded.config.workloads.max_detected);
+            if cli.json {
+                emit_json(&workloads)
+            } else {
+                for workload in workloads {
+                    println!(
+                        "{:<18} {:<8} {}",
+                        workload.spec.name,
+                        workload.spec.kind,
+                        workload.spec.command.join(" ")
+                    );
+                }
+                Ok(())
+            }
+        }
+        WorkloadsCommand::Run(run_args) => {
+            let loaded = load_config(cli.config.as_deref(), &run_args.path)?;
+            let mut workloads =
+                detect_workloads(&run_args.path, loaded.config.workloads.max_detected);
+            if workloads.is_empty() {
+                bail!("no workloads detected for {}", run_args.path.display());
+            }
+            let iterations = run_args
+                .iterations
+                .unwrap_or(loaded.config.workloads.iterations);
+            let warmups = run_args.warmups.unwrap_or(loaded.config.workloads.warmups);
+
+            if run_args.all {
+                benchmark_workloads(
+                    &run_args.path,
+                    &mut workloads,
+                    &BenchmarkOptions {
+                        mode: BenchmarkMode::All,
+                        iterations,
+                        warmups,
+                        auto_limit: loaded.config.workloads.auto_limit,
+                    },
+                )?;
+            } else if let Some(name) = &run_args.name {
+                let workload = workloads
+                    .iter_mut()
+                    .find(|workload| workload.spec.name == *name)
+                    .with_context(|| format!("unknown workload `{name}`"))?;
+                benchmark_single_workload(&run_args.path, workload, iterations, warmups)?;
+            } else {
+                benchmark_workloads(
+                    &run_args.path,
+                    &mut workloads,
+                    &BenchmarkOptions {
+                        mode: BenchmarkMode::Auto,
+                        iterations,
+                        warmups,
+                        auto_limit: loaded.config.workloads.auto_limit,
+                    },
+                )?;
+            }
+
+            if cli.json {
+                emit_json(&workloads)
+            } else {
+                for workload in workloads {
+                    let summary = workload
+                        .result
+                        .as_ref()
+                        .map(|result| format!("{:.2} ms mean", result.stats.mean_ms))
+                        .unwrap_or_else(|| workload.status.clone());
+                    println!(
+                        "{:<18} {:<8} {}",
+                        workload.spec.name, workload.spec.kind, summary
+                    );
+                }
+                Ok(())
+            }
+        }
+    }
+}
+
+fn doctor_report(cli: &Cli, path: &Path) -> Result<DoctorReport> {
     let cwd = std::env::current_dir().context("read current directory")?;
-    let loaded = load_config(cli.config.as_deref(), &cli.path)?;
+    let loaded = load_config(cli.config.as_deref(), path)?;
+    let detected_projects = detect_projects(path);
     let mut checks = Vec::new();
     checks.push(DoctorCheck {
         name: "project path".into(),
-        ok: cli.path.exists(),
-        details: cli.path.display().to_string(),
+        ok: path.exists(),
+        details: path.display().to_string(),
     });
     checks.push(DoctorCheck {
         name: "config".into(),
@@ -358,6 +532,19 @@ fn doctor_report(cli: &Cli) -> Result<DoctorReport> {
         ok: !language_names().is_empty(),
         details: format!("{} scanners", language_names().len()),
     });
+    checks.push(DoctorCheck {
+        name: "projects".into(),
+        ok: !detected_projects.is_empty(),
+        details: if detected_projects.is_empty() {
+            "no known project manifests detected".into()
+        } else {
+            detected_projects
+                .iter()
+                .map(|project| project.kind.as_str())
+                .collect::<Vec<_>>()
+                .join(", ")
+        },
+    });
 
     Ok(DoctorReport {
         binary: "profilr".into(),
@@ -365,10 +552,43 @@ fn doctor_report(cli: &Cli) -> Result<DoctorReport> {
         cwd,
         config_source: loaded.source,
         auth_required: false,
-        default_mode: "interactive TUI when stdout is a terminal; pretty report otherwise".into(),
+        default_mode: "interactive TUI with hotspots, directories, and inferred workloads when stdout is a terminal".into(),
         runners: runner_statuses(),
+        detected_projects,
         checks,
     })
+}
+
+fn build_project_profile(
+    args: &ProjectArgs,
+    config: &Config,
+    sort: SortKey,
+) -> Result<crate::model::ProjectProfile> {
+    let mut profile = profile_project(&args.path, config, sort, &args.languages)?;
+    let bench_mode = args.bench.unwrap_or(config.workloads.benchmark_mode);
+    if bench_mode != BenchmarkMode::Off {
+        benchmark_workloads(
+            &args.path,
+            &mut profile.workloads,
+            &BenchmarkOptions {
+                mode: bench_mode,
+                iterations: resolved_iterations(args, config),
+                warmups: resolved_warmups(args, config),
+                auto_limit: config.workloads.auto_limit,
+            },
+        )?;
+    }
+    Ok(profile)
+}
+
+fn resolved_iterations(args: &ProjectArgs, config: &Config) -> usize {
+    args.iterations
+        .unwrap_or(config.workloads.iterations)
+        .max(1)
+}
+
+fn resolved_warmups(args: &ProjectArgs, config: &Config) -> usize {
+    args.warmups.unwrap_or(config.workloads.warmups)
 }
 
 fn print_doctor(report: DoctorReport) {
@@ -383,6 +603,17 @@ fn print_doctor(report: DoctorReport) {
             .unwrap_or_else(|| "built-in defaults".into())
     );
     println!("auth required: {}", report.auth_required);
+    if !report.detected_projects.is_empty() {
+        println!(
+            "detected projects: {}",
+            report
+                .detected_projects
+                .iter()
+                .map(|project| project.kind.as_str())
+                .collect::<Vec<_>>()
+                .join(", ")
+        );
+    }
     for check in report.checks {
         println!(
             "{}: {} ({})",
@@ -410,9 +641,4 @@ fn log_event(cli: &Cli, event: &str) -> Result<()> {
         cli.path.display()
     )?;
     Ok(())
-}
-
-#[allow(dead_code)]
-fn path_display(path: &Path) -> String {
-    path.to_string_lossy().into_owned()
 }

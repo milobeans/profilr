@@ -26,6 +26,7 @@ pub struct CommandOptions {
     pub command: Vec<String>,
     pub iterations: usize,
     pub warmups: usize,
+    pub cwd: Option<PathBuf>,
 }
 
 #[derive(Clone, Debug)]
@@ -47,6 +48,7 @@ pub fn profile_snippet(options: SnippetOptions) -> Result<SnippetProfile> {
         options.iterations,
         options.warmups,
         setup_ms,
+        None,
     )?;
 
     if let Some(temp_dir) = runner.temp_dir {
@@ -69,10 +71,18 @@ pub fn profile_command(options: CommandOptions) -> Result<CommandProfile> {
 
     let program = options.command[0].clone();
     let args = options.command[1..].to_vec();
-    let runs = run_iterations(&program, &args, options.iterations, options.warmups, 0.0)?;
+    let runs = run_iterations(
+        &program,
+        &args,
+        options.iterations,
+        options.warmups,
+        0.0,
+        options.cwd.as_deref(),
+    )?;
 
     Ok(CommandProfile {
         command: options.command,
+        cwd: options.cwd,
         stats: runs.stats,
         exit_code: runs.exit_code,
         stdout_preview: runs.stdout_preview,
@@ -242,13 +252,14 @@ fn run_iterations(
     iterations: usize,
     warmups: usize,
     setup_ms: f64,
+    cwd: Option<&Path>,
 ) -> Result<IterationRuns> {
     if iterations == 0 {
         bail!("iterations must be greater than zero");
     }
 
     for _ in 0..warmups {
-        run_once(program, args).with_context(|| format!("warm up {program}"))?;
+        run_once(program, args, cwd).with_context(|| format!("warm up {program}"))?;
     }
 
     let mut durations = Vec::with_capacity(iterations);
@@ -258,7 +269,7 @@ fn run_iterations(
 
     for _ in 0..iterations {
         let started = Instant::now();
-        let output = run_once(program, args).with_context(|| format!("run {program}"))?;
+        let output = run_once(program, args, cwd).with_context(|| format!("run {program}"))?;
         durations.push(started.elapsed().as_secs_f64() * 1000.0);
         last_exit_code = output.status.code();
         stdout_preview = preview(&output.stdout);
@@ -281,12 +292,13 @@ fn run_iterations(
     })
 }
 
-fn run_once(program: &str, args: &[String]) -> Result<std::process::Output> {
-    Command::new(program)
-        .args(args)
-        .stdin(Stdio::null())
-        .output()
-        .with_context(|| format!("spawn {program}"))
+fn run_once(program: &str, args: &[String], cwd: Option<&Path>) -> Result<std::process::Output> {
+    let mut command = Command::new(program);
+    command.args(args).stdin(Stdio::null());
+    if let Some(path) = cwd {
+        command.current_dir(path);
+    }
+    command.output().with_context(|| format!("spawn {program}"))
 }
 
 fn timing_stats(

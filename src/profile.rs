@@ -11,7 +11,8 @@ use ignore::WalkBuilder;
 use crate::{
     config::Config,
     languages::language_for_path,
-    model::{Hotspot, LanguageSummary, ProjectProfile, SortKey},
+    model::{DirectorySummary, Hotspot, LanguageSummary, ProjectProfile, SortKey},
+    workload::{detect_projects, detect_workloads},
 };
 
 pub fn profile_project(
@@ -115,11 +116,14 @@ pub fn profile_project(
 
     rank_hotspots(&mut hotspots, sort);
     let languages = summarize_languages(&hotspots);
+    let directories = summarize_directories(&hotspots);
+    let workloads = detect_workloads(&root, config.workloads.max_detected);
     let total_lines = hotspots.iter().map(|hotspot| hotspot.lines).sum();
     let total_bytes = hotspots.iter().map(|hotspot| hotspot.bytes).sum();
 
     Ok(ProjectProfile {
-        root,
+        schema_version: "2".into(),
+        root: root.clone(),
         generated_unix_ms: now_unix_ms(),
         scan_duration_ms: started.elapsed().as_millis(),
         total_files,
@@ -128,8 +132,11 @@ pub fn profile_project(
         total_bytes,
         skipped_files,
         warnings,
+        detected_projects: detect_projects(&root),
         languages,
+        directories,
         hotspots,
+        workloads,
     })
 }
 
@@ -202,13 +209,12 @@ fn analyze_file(root: &Path, path: &Path, language: &str, text: &str, bytes: u64
         async_markers,
         max_line_chars,
     };
-    let score = score_file(signals);
 
     Hotspot {
         rank: 0,
         path: display_path(root, path),
         language: language.to_string(),
-        score,
+        score: score_file(signals),
         lines,
         bytes,
         functions,
@@ -364,14 +370,24 @@ fn summarize_languages(hotspots: &[Hotspot]) -> Vec<LanguageSummary> {
         summary.lines += hotspot.lines;
         summary.bytes += hotspot.bytes;
         summary.score += hotspot.score;
-        let should_replace = summary
+        if summary.top_path.is_none() {
+            summary.top_path = Some(hotspot.path.clone());
+        }
+        if summary
+            .top_path
+            .as_ref()
+            .is_some_and(|path| path == &hotspot.path)
+        {
+            continue;
+        }
+        if let Some(current) = summary
             .top_path
             .as_ref()
             .and_then(|path| hotspots.iter().find(|candidate| &candidate.path == path))
-            .map(|current| hotspot.score > current.score)
-            .unwrap_or(true);
-        if should_replace {
-            summary.top_path = Some(hotspot.path.clone());
+        {
+            if hotspot.score > current.score {
+                summary.top_path = Some(hotspot.path.clone());
+            }
         }
     }
 
@@ -383,6 +399,66 @@ fn summarize_languages(hotspots: &[Hotspot]) -> Vec<LanguageSummary> {
             .unwrap_or(std::cmp::Ordering::Equal)
     });
     values
+}
+
+fn summarize_directories(hotspots: &[Hotspot]) -> Vec<DirectorySummary> {
+    #[derive(Default)]
+    struct DirectoryAccum {
+        files: usize,
+        lines: usize,
+        bytes: u64,
+        score: f64,
+        languages: BTreeMap<String, usize>,
+        top_path: Option<String>,
+        top_score: f64,
+    }
+
+    let mut directories: BTreeMap<String, DirectoryAccum> = BTreeMap::new();
+    for hotspot in hotspots {
+        let directory = top_level_path(&hotspot.path);
+        let entry = directories.entry(directory).or_default();
+        entry.files += 1;
+        entry.lines += hotspot.lines;
+        entry.bytes += hotspot.bytes;
+        entry.score += hotspot.score;
+        *entry.languages.entry(hotspot.language.clone()).or_default() += 1;
+        if hotspot.score >= entry.top_score {
+            entry.top_score = hotspot.score;
+            entry.top_path = Some(hotspot.path.clone());
+        }
+    }
+
+    let mut values: Vec<DirectorySummary> = directories
+        .into_iter()
+        .map(|(path, summary)| DirectorySummary {
+            path,
+            files: summary.files,
+            lines: summary.lines,
+            bytes: summary.bytes,
+            score: summary.score,
+            dominant_language: summary
+                .languages
+                .into_iter()
+                .max_by_key(|(_, count)| *count)
+                .map(|(language, _)| language),
+            top_path: summary.top_path,
+        })
+        .collect();
+
+    values.sort_by(|left, right| {
+        right
+            .score
+            .partial_cmp(&left.score)
+            .unwrap_or(std::cmp::Ordering::Equal)
+            .then_with(|| left.path.cmp(&right.path))
+    });
+    values
+}
+
+fn top_level_path(path: &str) -> String {
+    path.split_once('/')
+        .map(|(directory, _)| directory.to_string())
+        .unwrap_or_else(|| ".".into())
 }
 
 fn rank_hotspots(hotspots: &mut [Hotspot], sort: SortKey) {
@@ -469,6 +545,11 @@ mod tests {
         let _ = fs::remove_dir_all(&root);
         fs::create_dir_all(root.join("src")).expect("create temp project");
         fs::write(
+            root.join("Cargo.toml"),
+            "[package]\nname = \"demo\"\nversion = \"0.1.0\"\n",
+        )
+        .expect("write manifest");
+        fs::write(
             root.join("src/main.rs"),
             "fn main() { for value in 0..10 { if value > 3 { println!(\"{}\", value); } } }",
         )
@@ -481,5 +562,9 @@ mod tests {
         assert_eq!(profile.total_profiled_files, 1);
         assert_eq!(profile.hotspots[0].language, "Rust");
         assert!(profile.hotspots[0].score > 0.0);
+        assert!(profile
+            .workloads
+            .iter()
+            .any(|workload| workload.spec.name == "cargo-check"));
     }
 }
