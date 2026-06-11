@@ -222,8 +222,8 @@ enum ToolsCommand {
 #[derive(Copy, Clone, Debug, Default, Eq, PartialEq, ValueEnum)]
 enum LogLevel {
     Error,
-    Warn,
     #[default]
+    Warn,
     Info,
     Debug,
     Trace,
