@@ -859,9 +859,9 @@ fn draw_footer(frame: &mut Frame<'_>, app: &TuiApp, area: Rect) {
     } else if !app.status.is_empty() {
         app.status.as_str()
     } else if area.width < 96 {
-        "1-4 tabs  j/k move  / filter  Enter run/open  ? help"
+        "1-4 tabs  j/k move  / filter  Enter run/open  ? help  q quit"
     } else {
-        "1-4 tabs  j/k move  / filter  s sort hotspots  Enter/o open or run  r run workload  ? help"
+        "1-4 tabs  j/k move  / filter  s sort hotspots  Enter/o open or run  r run workload  ? help  q quit"
     };
     frame.render_widget(
         Paragraph::new(mode).block(Block::default().borders(Borders::ALL)),
